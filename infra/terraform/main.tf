@@ -153,7 +153,7 @@ resource "aws_security_group" "jobai" {
 # EC2
 resource "aws_instance" "jobai" {
   ami                    = var.ami_id
-  instance_type          = "t3.micro"
+  instance_type          = "t3.small"
   subnet_id              = aws_subnet.jobai_public.id
   vpc_security_group_ids = [aws_security_group.jobai.id]
   key_name               = var.key_name
