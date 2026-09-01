@@ -6,7 +6,7 @@
 
 locals {
   monitoring_config_bucket = "jobai-monitoring-config-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
-  slack_webhook_param      = "/jobai/prod/monitoring/slack_webhook_url"
+  monitoring_param_path    = "/jobai/prod/monitoring"
 }
 
 resource "aws_s3_bucket" "monitoring_config" {
@@ -54,6 +54,13 @@ resource "aws_s3_object" "prometheus_config" {
     backend_private_ip = aws_instance.jobai.private_ip
     ai_private_ip      = aws_instance.ai_server.private_ip
   })
+}
+
+resource "aws_s3_object" "loki_config" {
+  bucket      = aws_s3_bucket.monitoring_config.id
+  key         = "loki/loki-config.yml"
+  content     = file("${path.module}/../loki/loki-config.yml")
+  source_hash = filemd5("${path.module}/../loki/loki-config.yml")
 }
 
 resource "aws_s3_object" "grafana_datasource" {
@@ -129,6 +136,16 @@ resource "aws_security_group" "monitoring" {
     cidr_blocks = ["${var.my_ip}/32"]
   }
 
+  # 앱 호스트의 로그 수집기가 Loki로 push 한다.
+  # 앱 보안그룹을 참조하면 순환 의존이 생기므로 VPC 내부로 제한한다.
+  ingress {
+    description = "Loki push from hosts inside the VPC"
+    from_port   = 3100
+    to_port     = 3100
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.jobai.cidr_block]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -188,8 +205,8 @@ resource "aws_iam_policy" "monitoring_config_access" {
       },
       {
         Effect   = "Allow"
-        Action   = ["ssm:GetParameter"]
-        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.slack_webhook_param}"
+        Action   = ["ssm:GetParameter", "ssm:GetParametersByPath"]
+        Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.monitoring_param_path}/*"
       }
     ]
   })
@@ -238,15 +255,18 @@ resource "aws_instance" "monitoring" {
     mkdir -p /opt/monitoring
     aws s3 sync "s3://${aws_s3_bucket.monitoring_config.id}/" /opt/monitoring/ --region ${var.aws_region}
 
-    WEBHOOK=$(aws ssm get-parameter \
-      --region ${var.aws_region} \
-      --name "${local.slack_webhook_param}" \
-      --with-decryption \
-      --query "Parameter.Value" \
-      --output text 2>/dev/null || true)
-
+    # 알림 채널이 바뀌어도 파라미터만 추가하면 되도록 경로 전체를 환경변수로 만든다.
     umask 077
-    printf 'SLACK_WEBHOOK_URL=%s\n' "$WEBHOOK" > /opt/monitoring/.env
+    : > /opt/monitoring/.env
+    aws ssm get-parameters-by-path --region ${var.aws_region} \
+      --path "${local.monitoring_param_path}" --recursive --with-decryption \
+      --query "Parameters[].[Name,Value]" --output text 2>/dev/null |
+      while IFS=$'\t' read -r pname pvalue; do
+        KEY=$(basename "$pname" | tr '[:lower:]' '[:upper:]')
+        printf '%s=%s\n' "$KEY" "$pvalue" >> /opt/monitoring/.env
+      done
+    grep -q '^SLACK_WEBHOOK_URL='   /opt/monitoring/.env || echo 'SLACK_WEBHOOK_URL='   >> /opt/monitoring/.env
+    grep -q '^DISCORD_WEBHOOK_URL=' /opt/monitoring/.env || echo 'DISCORD_WEBHOOK_URL=' >> /opt/monitoring/.env
 
     cd /opt/monitoring
     /usr/local/bin/docker-compose up -d

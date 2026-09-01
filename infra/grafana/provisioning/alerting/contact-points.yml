@@ -1,15 +1,21 @@
 apiVersion: 1
 
+# 웹훅 URL은 SSM Parameter Store(SecureString)에서 부팅 시 주입된다.
+# 저장소에는 값이 들어가지 않는다.
+#
+# 주의: Grafana는 URL이 빈 문자열이면 설정 검증에 실패해 기동 자체를 중단한다.
+# 따라서 값이 없는 채널은 여기에 두지 않는다.
 contactPoints:
   - orgId: 1
-    name: discord
+    name: slack
     receivers:
-      - uid: discord-webhook
-        type: discord
+      - uid: slack-webhook
+        type: slack
         settings:
-          url: ${DISCORD_WEBHOOK_URL}
-          message: >-
-            {{ range .Alerts }}**{{ .Annotations.summary }}**
+          url: ${SLACK_WEBHOOK_URL}
+          title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+          text: >-
+            {{ range .Alerts }}{{ .Annotations.summary }}
             {{ if .Annotations.description }}{{ .Annotations.description }}{{ end }}
             {{ end }}
         disableResolveMessage: false

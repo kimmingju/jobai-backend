@@ -48,6 +48,15 @@ resource "aws_security_group" "ai_server" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # 로그 수집기가 모니터링 인스턴스의 Loki로 전송한다. VPC 내부로만 나간다.
+  egress {
+    description = "ship logs to Loki inside the VPC"
+    from_port   = 3100
+    to_port     = 3100
+    protocol    = "tcp"
+    cidr_blocks = [aws_vpc.jobai.cidr_block]
+  }
+
   tags = {
     Name = "jobai-ai-server-sg"
   }

@@ -1,3 +1,13 @@
 /gradlew text eol=lf
 *.bat text eol=crlf
 *.jar binary
+
+# 컨테이너와 EC2에서 그대로 실행되는 파일들은 LF로 고정한다.
+# Windows 체크아웃에서 CRLF가 섞이면 Terraform이 user_data 변경으로 오인해
+# 인스턴스를 정지/재시작시킨다 (실제로 겪음).
+*.tf      text eol=lf
+*.tftpl   text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.alloy   text eol=lf
+*.sh      text eol=lf
