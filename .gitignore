@@ -62,3 +62,9 @@ infra/terraform/.terraform/
 **/*.tfstate
 **/*.tfstate.backup
 *.tfvars
+
+# Claude Code 개인 설정 (로컬 전용)
+.claude/settings.local.json
+
+# 부하테스트용 인증 토큰 (실제 JWT, 절대 커밋 금지)
+infra/loadtest/tokens.json
