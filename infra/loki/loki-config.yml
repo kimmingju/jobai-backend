@@ -1,0 +1,46 @@
+# 단일 노드 구성. t3.micro에 Prometheus/Grafana와 함께 올라가므로
+# 보존 기간과 수집률을 좁게 잡아 메모리를 아낀다.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  retention_period: 168h        # 7일. 포트폴리오 용도로 충분하고 디스크를 아낀다
+  ingestion_rate_mb: 4
+  ingestion_burst_size_mb: 8
+  max_streams_per_user: 5000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h   # 기존 컨테이너의 과거 로그도 최초 1회 수집되도록 보존 기간과 맞춘다
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+
+analytics:
+  reporting_enabled: false

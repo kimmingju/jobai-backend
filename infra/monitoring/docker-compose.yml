@@ -9,6 +9,32 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
 
+  # 로그 중앙화. 2026-08-26 장애 때 인스턴스가 응답하지 않아
+  # docker logs 조회 자체가 불가능했던 것이 도입 이유다.
+  loki:
+    image: grafana/loki:3.3.2
+    container_name: jobai-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+
+  # 모니터링 인스턴스 자신도 감시 대상에 넣는다.
+  # 관측 서버가 조용히 죽으면 다른 알림도 함께 멎는다.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: jobai-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      - /:/host:ro,rslave
+
   grafana:
     image: grafana/grafana:11.3.0
     container_name: jobai-grafana
@@ -18,7 +44,7 @@ services:
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
-      # 부팅 시 SSM Parameter Store에서 읽어 .env로 주입된다.
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL}
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
     volumes:
       - grafana_data:/var/lib/grafana
@@ -26,7 +52,9 @@ services:
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   prometheus_data:
   grafana_data:
+  loki_data:
