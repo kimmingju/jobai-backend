@@ -136,6 +136,20 @@ resource "aws_security_group" "monitoring" {
     cidr_blocks = ["${var.my_ip}/32"]
   }
 
+  # 팀원이 대시보드를 볼 수 있도록 임시 허용.
+  # 작업이 끝나면 monitoring_dev_ips를 비워 다시 닫는다.
+  dynamic "ingress" {
+    for_each = length(var.monitoring_dev_ips) > 0 ? [1] : []
+
+    content {
+      description = "temporary Grafana access for teammates"
+      from_port   = 3000
+      to_port     = 3000
+      protocol    = "tcp"
+      cidr_blocks = [for ip in var.monitoring_dev_ips : "${ip}/32"]
+    }
+  }
+
   # 앱 호스트의 로그 수집기가 Loki로 push 한다.
   # 앱 보안그룹을 참조하면 순환 의존이 생기므로 VPC 내부로 제한한다.
   ingress {

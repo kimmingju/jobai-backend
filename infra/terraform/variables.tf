@@ -99,3 +99,9 @@ variable "ai_server_dev_ips" {
   type        = list(string)
   default     = []
 }
+
+variable "monitoring_dev_ips" {
+  description = "Grafana(3000)에 접근할 팀원 공인 IP 목록. 임시 허용이며 작업이 끝나면 비운다."
+  type        = list(string)
+  default     = []
+}
