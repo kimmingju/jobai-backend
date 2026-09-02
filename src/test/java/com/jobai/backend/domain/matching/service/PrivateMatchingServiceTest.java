@@ -20,6 +20,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
@@ -55,6 +57,10 @@ class PrivateMatchingServiceTest {
         objectMapper = new ObjectMapper();
         when(privateMatchScoreRepository.findByResumeId(anyLong())).thenReturn(List.of());
 
+        PlatformTransactionManager txManager = mock(PlatformTransactionManager.class);
+        when(txManager.getTransaction(any())).thenReturn(mock(org.springframework.transaction.TransactionStatus.class));
+        TransactionTemplate transactionTemplate = new TransactionTemplate(txManager);
+
         service = new PrivateMatchingService(
                 aiScoringClient,
                 privateJobPostingRepository,
@@ -62,7 +68,8 @@ class PrivateMatchingServiceTest {
                 embeddingService,
                 privateMatchScoreRepository,
                 resumesRepository,
-                objectMapper
+                objectMapper,
+                transactionTemplate
         );
     }
 
@@ -113,8 +120,8 @@ class PrivateMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(privateMatchScoreRepository);
-        verifyNoInteractions(aiScoringClient);
+        verify(aiScoringClient, never()).scorePrivate(any());
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
     }
 
     @Test
@@ -127,7 +134,7 @@ class PrivateMatchingServiceTest {
         service.calculateScores(1L);
 
         verifyNoInteractions(aiScoringClient);
-        verify(privateMatchScoreRepository, never()).save(any());
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
     }
 
     @Test
@@ -136,44 +143,41 @@ class PrivateMatchingServiceTest {
         Member member = createMember("신입");
         Resumes resume = createResume(member, dummyEmbedding(), "[\"Java\"]");
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of());
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of());
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(privateMatchScoreRepository);
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
         verify(aiScoringClient, never()).scorePrivate(any());
     }
 
     @Test
-    @DisplayName("마감된 공고는 점수 계산에서 제외된다")
+    @DisplayName("마감된 공고는 DB 쿼리 수준에서 제외된다")
     void calculateScores_마감공고제외() {
         Member member = createMember("신입");
         Resumes resume = createResume(member, dummyEmbedding(), "[\"Java\"]");
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
-
-        PrivateJobPosting closedPosting = createPosting("마감공고", "백엔드", true);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(closedPosting));
+        // findActiveByValidCategories는 DB 쿼리에서 마감 공고를 제외하므로 빈 리스트 반환
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of());
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(privateMatchScoreRepository);
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
         verify(aiScoringClient, never()).scorePrivate(any());
     }
 
     @Test
-    @DisplayName("미분류/미대상 카테고리의 공고는 제외된다")
+    @DisplayName("미분류/미대상 카테고리의 공고는 DB 쿼리 수준에서 제외된다")
     void calculateScores_미분류미대상_제외() {
         Member member = createMember("신입");
         Resumes resume = createResume(member, dummyEmbedding(), "[\"Java\"]");
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
-
-        PrivateJobPosting unclassified = createPosting("공고1", "미분류", false);
-        PrivateJobPosting notTarget = createPosting("공고2", "미대상", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(unclassified, notTarget));
+        // findActiveByValidCategories는 유효 카테고리만 조회하므로 미분류/미대상은 제외
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of());
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(privateMatchScoreRepository);
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
         verify(aiScoringClient, never()).scorePrivate(any());
     }
 
@@ -185,7 +189,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("백엔드 개발자", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         float[] jdVec = new float[]{0.4f, 0.5f, 0.6f};
         JobEmbedding jobEmbedding = JobEmbedding.builder()
@@ -202,14 +206,15 @@ class PrivateMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(privateMatchScoreRepository, never()).deleteByResumeId(anyLong());
-        verify(privateMatchScoreRepository).save(argThat(score -> {
-            assertThat(score.getScore()).isEqualTo(86); // Math.round(85.5)
-            assertThat(score.getScoreReason()).isEqualTo("기술스택 일치");
-            assertThat(score.getCareerMet()).isTrue();
-            assertThat(score.getModelVersion()).isEqualTo("v1.0");
-            return true;
-        }));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PrivateMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(privateMatchScoreRepository).saveAll(captor.capture());
+        List<PrivateMatchScore> saved = captor.getValue();
+        assertThat(saved).hasSize(1);
+        assertThat(saved.get(0).getScore()).isEqualTo(86); // Math.round(85.5)
+        assertThat(saved.get(0).getScoreReason()).isEqualTo("기술스택 일치");
+        assertThat(saved.get(0).getCareerMet()).isTrue();
+        assertThat(saved.get(0).getModelVersion()).isEqualTo("v1.0");
     }
 
     @Test
@@ -220,7 +225,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("ML 엔지니어", "AI/ML", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         float[] jdVec = new float[]{0.7f, 0.8f};
         JobEmbedding created = JobEmbedding.builder()
@@ -239,7 +244,7 @@ class PrivateMatchingServiceTest {
         service.calculateScores(1L);
 
         verify(embeddingService).embedPrivatePosting(posting);
-        verify(privateMatchScoreRepository).save(any());
+        verify(privateMatchScoreRepository).saveAll(anyList());
     }
 
     @Test
@@ -251,7 +256,7 @@ class PrivateMatchingServiceTest {
 
         PrivateJobPosting posting1 = createPosting("공고1", "프론트엔드", false);
         PrivateJobPosting posting2 = createPosting("공고2", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting1, posting2));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting1, posting2));
 
         // posting1: 임베딩 생성 실패
         when(jobEmbeddingRepository.findBySourceAndSourceId(JobSource.PRIVATE, posting1.getId()))
@@ -271,7 +276,10 @@ class PrivateMatchingServiceTest {
         service.calculateScores(1L);
 
         // posting1 실패해도 posting2는 정상 저장
-        verify(privateMatchScoreRepository, times(1)).save(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PrivateMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(privateMatchScoreRepository).saveAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(1);
     }
 
     @Test
@@ -282,7 +290,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("공고", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         PrivateMatchScore existingScore = PrivateMatchScore.builder()
                 .member(member)
@@ -302,9 +310,8 @@ class PrivateMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(privateMatchScoreRepository, never()).save(any());
-        verify(privateMatchScoreRepository, never()).delete(existingScore);
-        verify(privateMatchScoreRepository, never()).flush();
+        verify(privateMatchScoreRepository, never()).saveAll(anyList());
+        verify(privateMatchScoreRepository, never()).deleteAllById(anyList());
     }
 
     @Test
@@ -322,7 +329,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("개발자", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         JobEmbedding embed = JobEmbedding.builder()
                 .source(JobSource.PRIVATE).sourceId(posting.getId())
@@ -348,7 +355,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("개발자", "프론트엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         JobEmbedding embed = JobEmbedding.builder()
                 .source(JobSource.PRIVATE).sourceId(posting.getId())
@@ -374,7 +381,7 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("개발자", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         JobEmbedding embed = JobEmbedding.builder()
                 .source(JobSource.PRIVATE).sourceId(posting.getId())
@@ -393,7 +400,7 @@ class PrivateMatchingServiceTest {
     }
 
     @Test
-    @DisplayName("여러 공고에 대해 각각 점수를 계산하고 저장한다")
+    @DisplayName("여러 공고에 대해 각각 점수를 계산하고 일괄 저장한다")
     void calculateScores_여러공고_각각저장() {
         Member member = createMember("신입");
         Resumes resume = createResume(member, dummyEmbedding(), "[\"Java\"]");
@@ -401,7 +408,7 @@ class PrivateMatchingServiceTest {
 
         PrivateJobPosting posting1 = createPosting("공고A", "백엔드", false);
         PrivateJobPosting posting2 = createPosting("공고B", "프론트엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting1, posting2));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting1, posting2));
 
         JobEmbedding embed1 = JobEmbedding.builder()
                 .source(JobSource.PRIVATE).sourceId(posting1.getId())
@@ -421,7 +428,10 @@ class PrivateMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(privateMatchScoreRepository, times(2)).save(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PrivateMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(privateMatchScoreRepository).saveAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(2);
     }
 
     @Test
@@ -432,9 +442,10 @@ class PrivateMatchingServiceTest {
         when(resumesRepository.findById(1L)).thenReturn(Optional.of(resume));
 
         PrivateJobPosting posting = createPosting("공고", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(posting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(posting));
 
         PrivateMatchScore existingScore = PrivateMatchScore.builder()
+                .id(10L)
                 .member(member)
                 .resume(resume)
                 .privateJobPosting(posting)
@@ -454,10 +465,9 @@ class PrivateMatchingServiceTest {
 
         var inOrder = inOrder(privateMatchScoreRepository);
         inOrder.verify(privateMatchScoreRepository).findByResumeId(1L);
-        inOrder.verify(privateMatchScoreRepository).delete(existingScore);
+        inOrder.verify(privateMatchScoreRepository).deleteAllById(List.of(10L));
         inOrder.verify(privateMatchScoreRepository).flush();
-        inOrder.verify(privateMatchScoreRepository).save(any());
-        verify(privateMatchScoreRepository, never()).deleteByResumeId(anyLong());
+        inOrder.verify(privateMatchScoreRepository).saveAll(anyList());
     }
 
     @Test
@@ -469,11 +479,13 @@ class PrivateMatchingServiceTest {
 
         PrivateJobPosting failedPosting = createPosting("실패 공고", "백엔드", false);
         PrivateJobPosting successfulPosting = createPosting("성공 공고", "백엔드", false);
-        when(privateJobPostingRepository.findAll()).thenReturn(List.of(failedPosting, successfulPosting));
+        when(privateJobPostingRepository.findActiveByValidCategories(anyList())).thenReturn(List.of(failedPosting, successfulPosting));
 
         PrivateMatchScore failedExisting = PrivateMatchScore.builder()
+                .id(20L)
                 .member(member).resume(resume).privateJobPosting(failedPosting).score(81).build();
         PrivateMatchScore successfulExisting = PrivateMatchScore.builder()
+                .id(21L)
                 .member(member).resume(resume).privateJobPosting(successfulPosting).score(72).build();
         when(privateMatchScoreRepository.findByResumeId(1L))
                 .thenReturn(List.of(failedExisting, successfulExisting));
@@ -494,11 +506,18 @@ class PrivateMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(privateMatchScoreRepository, never()).delete(failedExisting);
-        verify(privateMatchScoreRepository).delete(successfulExisting);
-        verify(privateMatchScoreRepository).flush();
-        verify(privateMatchScoreRepository).save(argThat(score ->
-                score.getPrivateJobPosting().equals(successfulPosting) && score.getScore() == 90));
-        verify(privateMatchScoreRepository, never()).deleteByResumeId(anyLong());
+        // 실패한 공고의 기존 점수(id=20)는 삭제 대상에 포함되지 않음
+        // 성공한 공고의 기존 점수(id=21)만 삭제 후 새 점수로 교체
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Iterable<Long>> deleteCaptor = ArgumentCaptor.forClass(Iterable.class);
+        verify(privateMatchScoreRepository).deleteAllById(deleteCaptor.capture());
+        assertThat(deleteCaptor.getValue()).containsExactly(21L);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PrivateMatchScore>> saveCaptor = ArgumentCaptor.forClass(List.class);
+        verify(privateMatchScoreRepository).saveAll(saveCaptor.capture());
+        assertThat(saveCaptor.getValue()).hasSize(1);
+        assertThat(saveCaptor.getValue().get(0).getPrivateJobPosting()).isEqualTo(successfulPosting);
+        assertThat(saveCaptor.getValue().get(0).getScore()).isEqualTo(90);
     }
 }

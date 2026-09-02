@@ -10,7 +10,6 @@ import com.jobai.backend.domain.privatejobposting.entity.PrivateJobPosting;
 import com.jobai.backend.domain.privatejobposting.repository.PrivateJobPostingRepository;
 import com.jobai.backend.domain.matching.entity.PrivateMatchScore;
 import com.jobai.backend.domain.matching.repository.PrivateMatchScoreRepository;
-import com.jobai.backend.domain.member.entity.Member;
 import com.jobai.backend.domain.member.entity.Resumes;
 import com.jobai.backend.domain.member.repository.ResumesRepository;
 import com.jobai.backend.domain.search.entity.JobEmbedding;
@@ -21,7 +20,7 @@ import com.jobai.backend.domain.search.service.EmbeddingService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -45,38 +44,61 @@ public class PrivateMatchingService {
     private final PrivateMatchScoreRepository privateMatchScoreRepository;
     private final ResumesRepository resumesRepository;
     private final ObjectMapper objectMapper;
+    private final TransactionTemplate transactionTemplate;
 
-    @Transactional
     public void calculateScores(Long resumeId) {
-        Resumes resume = resumesRepository.findById(resumeId).orElse(null);
-        if (resume == null) {
-            log.warn("이력서를 찾을 수 없음: resumeId={}", resumeId);
-            return;
-        }
+        // 읽기 단계: 짧은 readOnly 트랜잭션으로 필요한 데이터 조회
+        record ReadResult(
+                Resumes resume,
+                List<PrivateJobPosting> activePostings,
+                Map<Long, PrivateMatchScore> existingScores,
+                List<String> resumeSkills,
+                List<Double> resumeVec,
+                int experienceYears
+        ) {}
 
-        if (resume.getEmbedding() == null) {
-            log.warn("이력서 임베딩이 없어 점수 계산 불가: resumeId={}", resumeId);
-            return;
-        }
+        TransactionTemplate readOnlyTx = new TransactionTemplate(transactionTemplate.getTransactionManager());
+        readOnlyTx.setReadOnly(true);
 
-        // 활성 공고 조회 (유효 카테고리만)
-        List<PrivateJobPosting> activePostings = findActivePostings();
-        if (activePostings.isEmpty()) {
-            log.info("활성 공고가 없어 점수 계산 건너뜀: resumeId={}", resumeId);
-            return;
-        }
+        ReadResult readResult = readOnlyTx.execute(status -> {
+            Resumes resume = resumesRepository.findById(resumeId).orElse(null);
+            if (resume == null) {
+                log.warn("이력서를 찾을 수 없음: resumeId={}", resumeId);
+                return null;
+            }
+            if (resume.getEmbedding() == null) {
+                log.warn("이력서 임베딩이 없어 점수 계산 불가: resumeId={}", resumeId);
+                return null;
+            }
 
-        Map<Long, PrivateMatchScore> existingScores = privateMatchScoreRepository.findByResumeId(resumeId).stream()
-                .collect(Collectors.toMap(score -> score.getPrivateJobPosting().getId(), score -> score));
+            List<PrivateJobPosting> activePostings = findActivePostings();
+            if (activePostings.isEmpty()) {
+                log.info("활성 공고가 없어 점수 계산 건너뜀: resumeId={}", resumeId);
+                return null;
+            }
 
-        List<String> resumeSkills = parseSkills(resume.getResumeSkills());
-        List<Double> resumeVec = toDoubleList(resume.getEmbedding());
-        int experienceYears = resolveExperienceYears(resume);
+            Map<Long, PrivateMatchScore> existingScores = privateMatchScoreRepository.findByResumeId(resumeId).stream()
+                    .collect(Collectors.toMap(score -> score.getPrivateJobPosting().getId(), score -> score));
 
+            return new ReadResult(
+                    resume,
+                    activePostings,
+                    existingScores,
+                    parseSkills(resume.getResumeSkills()),
+                    toDoubleList(resume.getEmbedding()),
+                    resolveExperienceYears(resume)
+            );
+        });
+
+        if (readResult == null) return;
+
+        // AI 호출 단계: 트랜잭션 밖에서 루프 돌며 점수 계산
+        List<PrivateMatchScore> toSave = new ArrayList<>();
+        List<Long> toDeleteIds = new ArrayList<>();
         int successCount = 0;
         int failCount = 0;
 
-        for (PrivateJobPosting posting : activePostings) {
+        for (PrivateJobPosting posting : readResult.activePostings()) {
             try {
                 float[] jdVec = getOrCreateJobEmbedding(posting);
                 if (jdVec == null) {
@@ -86,7 +108,8 @@ public class PrivateMatchingService {
 
                 String jdText = buildJdText(posting);
                 ScorePrivateRequest request = new ScorePrivateRequest(
-                        jdText, toDoubleList(jdVec), resumeVec, resumeSkills, experienceYears);
+                        jdText, toDoubleList(jdVec), readResult.resumeVec(),
+                        readResult.resumeSkills(), readResult.experienceYears());
 
                 ScorePrivateResponse response = aiScoringClient.scorePrivate(request).block();
                 if (response == null) {
@@ -94,9 +117,14 @@ public class PrivateMatchingService {
                     continue;
                 }
 
+                PrivateMatchScore existing = readResult.existingScores().get(posting.getId());
+                if (existing != null) {
+                    toDeleteIds.add(existing.getId());
+                }
+
                 PrivateMatchScore replacement = PrivateMatchScore.builder()
-                        .member(resume.getMember())
-                        .resume(resume)
+                        .member(readResult.resume().getMember())
+                        .resume(readResult.resume())
                         .privateJobPosting(posting)
                         .score((int) Math.round(response.score()))
                         .scoreReason(response.scoreReason())
@@ -105,7 +133,7 @@ public class PrivateMatchingService {
                         .careerMet(response.careerMet())
                         .modelVersion(response.modelVersion())
                         .build();
-                saveOrReplace(existingScores.get(posting.getId()), replacement);
+                toSave.add(replacement);
                 successCount++;
             } catch (Exception e) {
                 log.warn("공고 점수 계산 실패: postingId={}, error={}", posting.getId(), e.getMessage());
@@ -113,15 +141,18 @@ public class PrivateMatchingService {
             }
         }
 
-        log.info("매칭 점수 계산 결과: resumeId={}, 성공={}, 실패={}", resumeId, successCount, failCount);
-    }
-
-    private void saveOrReplace(PrivateMatchScore existing, PrivateMatchScore replacement) {
-        if (existing != null) {
-            privateMatchScoreRepository.delete(existing);
-            privateMatchScoreRepository.flush();
+        // 저장 단계: 짧은 트랜잭션에서 일괄 저장
+        if (!toSave.isEmpty() || !toDeleteIds.isEmpty()) {
+            transactionTemplate.executeWithoutResult(status -> {
+                if (!toDeleteIds.isEmpty()) {
+                    privateMatchScoreRepository.deleteAllById(toDeleteIds);
+                    privateMatchScoreRepository.flush();
+                }
+                privateMatchScoreRepository.saveAll(toSave);
+            });
         }
-        privateMatchScoreRepository.save(replacement);
+
+        log.info("매칭 점수 계산 결과: resumeId={}, 성공={}, 실패={}", resumeId, successCount, failCount);
     }
 
     private float[] getOrCreateJobEmbedding(PrivateJobPosting posting) {
@@ -144,11 +175,7 @@ public class PrivateMatchingService {
     }
 
     private List<PrivateJobPosting> findActivePostings() {
-        return privateJobPostingRepository.findAll().stream()
-                .filter(p -> !p.isClosed())
-                .filter(p -> p.getJobCategory() != null)
-                .filter(p -> JobCategory.matchTargetLabels().contains(p.getJobCategory()))
-                .collect(Collectors.toList());
+        return privateJobPostingRepository.findActiveByValidCategories(JobCategory.matchTargetLabels());
     }
 
     private String buildJdText(PrivateJobPosting posting) {

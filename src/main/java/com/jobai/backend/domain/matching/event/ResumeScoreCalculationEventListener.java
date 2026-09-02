@@ -17,7 +17,7 @@ public class ResumeScoreCalculationEventListener {
     private final PrivateMatchingService privateMatchingService;
     private final PublicMatchingService publicMatchingService;
 
-    @Async
+    @Async("schedulerTaskExecutor")
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void calculateScores(ResumeScoreCalculationRequestedEvent event) {
         calculatePrivateScores(event.resumeId());

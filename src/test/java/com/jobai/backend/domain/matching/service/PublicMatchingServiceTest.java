@@ -20,6 +20,8 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
@@ -55,6 +57,10 @@ class PublicMatchingServiceTest {
         objectMapper = new ObjectMapper();
         when(publicMatchScoreRepository.findByResumeId(anyLong())).thenReturn(List.of());
 
+        PlatformTransactionManager txManager = mock(PlatformTransactionManager.class);
+        when(txManager.getTransaction(any())).thenReturn(mock(org.springframework.transaction.TransactionStatus.class));
+        TransactionTemplate transactionTemplate = new TransactionTemplate(txManager);
+
         service = new PublicMatchingService(
                 aiScoringClient,
                 jobPostingRepository,
@@ -62,7 +68,8 @@ class PublicMatchingServiceTest {
                 embeddingService,
                 publicMatchScoreRepository,
                 resumesRepository,
-                objectMapper
+                objectMapper,
+                transactionTemplate
         );
     }
 
@@ -119,8 +126,8 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(publicMatchScoreRepository);
-        verifyNoInteractions(aiScoringClient);
+        verify(aiScoringClient, never()).scorePublic(any());
+        verify(publicMatchScoreRepository, never()).saveAll(anyList());
     }
 
     @Test
@@ -133,7 +140,7 @@ class PublicMatchingServiceTest {
         service.calculateScores(1L);
 
         verifyNoInteractions(aiScoringClient);
-        verify(publicMatchScoreRepository, never()).save(any());
+        verify(publicMatchScoreRepository, never()).saveAll(anyList());
     }
 
     @Test
@@ -146,7 +153,7 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verifyNoInteractions(publicMatchScoreRepository);
+        verify(publicMatchScoreRepository, never()).saveAll(anyList());
         verify(aiScoringClient, never()).scorePublic(any());
     }
 
@@ -174,14 +181,15 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(publicMatchScoreRepository, never()).deleteByResumeId(anyLong());
-        verify(publicMatchScoreRepository).save(argThat(score -> {
-            assertThat(score.getScore()).isEqualTo(86); // Math.round(85.5)
-            assertThat(score.getScoreReason()).isEqualTo("직무 클러스터 일치");
-            assertThat(score.getJobCluster()).isEqualTo("데이터/AI");
-            assertThat(score.getResumeCluster()).isEqualTo("데이터/AI");
-            return true;
-        }));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PublicMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(publicMatchScoreRepository).saveAll(captor.capture());
+        List<PublicMatchScore> saved = captor.getValue();
+        assertThat(saved).hasSize(1);
+        assertThat(saved.get(0).getScore()).isEqualTo(86); // Math.round(85.5)
+        assertThat(saved.get(0).getScoreReason()).isEqualTo("직무 클러스터 일치");
+        assertThat(saved.get(0).getJobCluster()).isEqualTo("데이터/AI");
+        assertThat(saved.get(0).getResumeCluster()).isEqualTo("데이터/AI");
     }
 
     @Test
@@ -210,7 +218,7 @@ class PublicMatchingServiceTest {
         service.calculateScores(1L);
 
         verify(embeddingService).embedPublicPosting(posting);
-        verify(publicMatchScoreRepository).save(any());
+        verify(publicMatchScoreRepository).saveAll(anyList());
     }
 
     @Test
@@ -239,7 +247,10 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(publicMatchScoreRepository, times(1)).save(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PublicMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(publicMatchScoreRepository).saveAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(1);
     }
 
     @Test
@@ -270,9 +281,8 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(publicMatchScoreRepository, never()).save(any());
-        verify(publicMatchScoreRepository, never()).delete(existingScore);
-        verify(publicMatchScoreRepository, never()).flush();
+        verify(publicMatchScoreRepository, never()).saveAll(anyList());
+        verify(publicMatchScoreRepository, never()).deleteAllById(anyList());
     }
 
     @Test
@@ -384,7 +394,7 @@ class PublicMatchingServiceTest {
     }
 
     @Test
-    @DisplayName("여러 공고에 대해 각각 점수를 계산하고 저장한다")
+    @DisplayName("여러 공고에 대해 각각 점수를 계산하고 일괄 저장한다")
     void calculateScores_여러공고_각각저장() {
         Member member = createMember("신입");
         Resumes resume = createResume(member, dummyEmbedding(), "[\"Java\"]");
@@ -412,7 +422,10 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(publicMatchScoreRepository, times(2)).save(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PublicMatchScore>> captor = ArgumentCaptor.forClass(List.class);
+        verify(publicMatchScoreRepository).saveAll(captor.capture());
+        assertThat(captor.getValue()).hasSize(2);
     }
 
     @Test
@@ -426,6 +439,7 @@ class PublicMatchingServiceTest {
         when(jobPostingRepository.findActivePublicPostings()).thenReturn(List.of(posting));
 
         PublicMatchScore existingScore = PublicMatchScore.builder()
+                .id(10L)
                 .member(member)
                 .resume(resume)
                 .publicJobPosting(posting)
@@ -445,10 +459,9 @@ class PublicMatchingServiceTest {
 
         var inOrder = inOrder(publicMatchScoreRepository);
         inOrder.verify(publicMatchScoreRepository).findByResumeId(1L);
-        inOrder.verify(publicMatchScoreRepository).delete(existingScore);
+        inOrder.verify(publicMatchScoreRepository).deleteAllById(List.of(10L));
         inOrder.verify(publicMatchScoreRepository).flush();
-        inOrder.verify(publicMatchScoreRepository).save(any());
-        verify(publicMatchScoreRepository, never()).deleteByResumeId(anyLong());
+        inOrder.verify(publicMatchScoreRepository).saveAll(anyList());
     }
 
     @Test
@@ -463,8 +476,10 @@ class PublicMatchingServiceTest {
         when(jobPostingRepository.findActivePublicPostings()).thenReturn(List.of(failedPosting, successfulPosting));
 
         PublicMatchScore failedExisting = PublicMatchScore.builder()
+                .id(20L)
                 .member(member).resume(resume).publicJobPosting(failedPosting).score(83).build();
         PublicMatchScore successfulExisting = PublicMatchScore.builder()
+                .id(21L)
                 .member(member).resume(resume).publicJobPosting(successfulPosting).score(74).build();
         when(publicMatchScoreRepository.findByResumeId(1L))
                 .thenReturn(List.of(failedExisting, successfulExisting));
@@ -485,11 +500,18 @@ class PublicMatchingServiceTest {
 
         service.calculateScores(1L);
 
-        verify(publicMatchScoreRepository, never()).delete(failedExisting);
-        verify(publicMatchScoreRepository).delete(successfulExisting);
-        verify(publicMatchScoreRepository).flush();
-        verify(publicMatchScoreRepository).save(argThat(score ->
-                score.getPublicJobPosting().equals(successfulPosting) && score.getScore() == 91));
-        verify(publicMatchScoreRepository, never()).deleteByResumeId(anyLong());
+        // 실패한 공고의 기존 점수(id=20)는 삭제 대상에 포함되지 않음
+        // 성공한 공고의 기존 점수(id=21)만 삭제 후 새 점수로 교체
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Iterable<Long>> deleteCaptor = ArgumentCaptor.forClass(Iterable.class);
+        verify(publicMatchScoreRepository).deleteAllById(deleteCaptor.capture());
+        assertThat(deleteCaptor.getValue()).containsExactly(21L);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<PublicMatchScore>> saveCaptor = ArgumentCaptor.forClass(List.class);
+        verify(publicMatchScoreRepository).saveAll(saveCaptor.capture());
+        assertThat(saveCaptor.getValue()).hasSize(1);
+        assertThat(saveCaptor.getValue().get(0).getPublicJobPosting()).isEqualTo(successfulPosting);
+        assertThat(saveCaptor.getValue().get(0).getScore()).isEqualTo(91);
     }
 }

@@ -17,6 +17,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
@@ -39,6 +40,7 @@ public class ResumeService {
     private final ApplicationEventPublisher eventPublisher;
     private final PrivateMatchScoreRepository privateMatchScoreRepository;
     private final PublicMatchScoreRepository publicMatchScoreRepository;
+    private final TransactionTemplate transactionTemplate;
 
     public ResumeResponseDTO.ResumeListDTO getResumes(String email) {
         List<Resumes> resumes = resumesRepository.findByMemberEmailOrderByUpdatedAtDescIdDesc(email);
@@ -62,57 +64,74 @@ public class ResumeService {
 
         validatePdf(file);
 
+        // 1) S3 업로드 — 트랜잭션 밖
         String key = "resumes/" + member.getId() + "/" + UUID.randomUUID() + "_" + file.getOriginalFilename();
         String fileUrl = fileStorageService.upload(file, key);
 
+        // 2) 짧은 트랜잭션 1: resume 메타데이터 저장 + 기존 이력서 비활성화
+        Resumes resume;
         try {
-            Resumes resume = Resumes.builder()
-                    .member(member)
-                    .originalFilename(file.getOriginalFilename())
-                    .storedFileUrl(fileUrl)
-                    .fileSize(formatFileSize(file.getSize()))
-                    .isActive(true) // 새로 업로드한 이력서를 항상 활성 이력서로 설정
-                    .updatedAt(LocalDate.now())
-                    .build();
-            Long resumeId = resumesRepository.save(resume).getId();
-            // 같은 회원의 기존 이력서는 모두 비활성화
-            resumesRepository.deactivateOthersByMemberId(member.getId(), resumeId);
-
-            // 이력서 파싱 (PDF 텍스트 추출 + 기술스택 파싱)
-            try {
-                byte[] pdfBytes = file.getBytes();
-                resumeParsingService.parseAndUpdate(resume, pdfBytes);
-            } catch (Exception e) {
-                log.warn("이력서 파싱 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
-            }
-
-            // 이력서 임베딩 (AI 서버 /embed/jd 호출, 사기업 매칭용)
-            if (resume.getExtractedText() != null && !resume.getExtractedText().isBlank()) {
-                try {
-                    float[] vector = embeddingService.embedResumeText(resume.getExtractedText());
-                    resume.updateEmbedding(vector);
-                } catch (Exception e) {
-                    log.warn("이력서 임베딩 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
-                }
-
-                // 이력서 NCS 임베딩 (AI 서버 /embed/ncs 호출, 공기업 매칭용)
-                try {
-                    float[] ncsVector = embeddingService.embedResumeTextNcs(resume.getExtractedText());
-                    resume.updateNcsEmbedding(ncsVector);
-                } catch (Exception e) {
-                    log.warn("이력서 NCS 임베딩 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
-                }
-            }
-
-            // 비동기 매칭 점수 계산 트리거
-            eventPublisher.publishEvent(new ResumeScoreCalculationRequestedEvent(resumeId));
-
-            return resumeId;
+            resume = transactionTemplate.execute(status -> {
+                Resumes r = Resumes.builder()
+                        .member(member)
+                        .originalFilename(file.getOriginalFilename())
+                        .storedFileUrl(fileUrl)
+                        .fileSize(formatFileSize(file.getSize()))
+                        .isActive(true)
+                        .updatedAt(LocalDate.now())
+                        .build();
+                Resumes saved = resumesRepository.save(r);
+                resumesRepository.deactivateOthersByMemberId(member.getId(), saved.getId());
+                return saved;
+            });
         } catch (Exception e) {
-            // DB 저장 실패 시 S3에 올라간 파일 제거
             fileStorageService.delete(fileUrl);
             throw e;
         }
+
+        Long resumeId = resume.getId();
+
+        // 3) 외부 호출 — 트랜잭션 밖 (커넥션 점유 없음)
+        // 이력서 파싱 (PDF 텍스트 추출 + 기술스택 파싱)
+        try {
+            byte[] pdfBytes = file.getBytes();
+            resumeParsingService.parseAndUpdate(resume, pdfBytes);
+        } catch (Exception e) {
+            log.warn("이력서 파싱 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
+        }
+
+        // 이력서 임베딩 (AI 서버 호출)
+        float[] embedding = null;
+        float[] ncsEmbedding = null;
+        if (resume.getExtractedText() != null && !resume.getExtractedText().isBlank()) {
+            try {
+                embedding = embeddingService.embedResumeText(resume.getExtractedText());
+            } catch (Exception e) {
+                log.warn("이력서 임베딩 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
+            }
+
+            try {
+                ncsEmbedding = embeddingService.embedResumeTextNcs(resume.getExtractedText());
+            } catch (Exception e) {
+                log.warn("이력서 NCS 임베딩 실패 (업로드는 정상 완료): resumeId={}, error={}", resumeId, e.getMessage());
+            }
+        }
+
+        // 4) 짧은 트랜잭션 2: 파싱/임베딩 결과 업데이트 + 이벤트 발행
+        final float[] finalEmbedding = embedding;
+        final float[] finalNcsEmbedding = ncsEmbedding;
+        transactionTemplate.executeWithoutResult(status -> {
+            Resumes managed = resumesRepository.findById(resumeId).orElseThrow();
+            if (finalEmbedding != null) {
+                managed.updateEmbedding(finalEmbedding);
+            }
+            if (finalNcsEmbedding != null) {
+                managed.updateNcsEmbedding(finalNcsEmbedding);
+            }
+            eventPublisher.publishEvent(new ResumeScoreCalculationRequestedEvent(resumeId));
+        });
+
+        return resumeId;
     }
 
     @Transactional

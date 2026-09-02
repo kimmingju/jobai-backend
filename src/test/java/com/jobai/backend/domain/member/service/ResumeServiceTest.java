@@ -21,6 +21,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.LocalDate;
 import java.util.List;
@@ -33,6 +35,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -71,10 +74,16 @@ class ResumeServiceTest {
 
     @org.junit.jupiter.api.BeforeEach
     void setUp() {
+        PlatformTransactionManager txManager = mock(PlatformTransactionManager.class);
+        org.mockito.Mockito.lenient().when(txManager.getTransaction(any()))
+                .thenReturn(mock(org.springframework.transaction.TransactionStatus.class));
+        TransactionTemplate transactionTemplate = new TransactionTemplate(txManager);
+
         resumeService = new ResumeService(
                 resumesRepository, memberRepository, fileStorageService,
                 resumeParsingService, embeddingService, eventPublisher,
-                privateMatchScoreRepository, publicMatchScoreRepository);
+                privateMatchScoreRepository, publicMatchScoreRepository,
+                transactionTemplate);
     }
 
     private Member member(Long id, String email) {
@@ -137,18 +146,17 @@ class ResumeServiceTest {
         when(fileStorageService.upload(eq(file), anyString())).thenReturn(fileUrl);
 
         ArgumentCaptor<Resumes> captor = ArgumentCaptor.forClass(Resumes.class);
-        when(resumesRepository.save(captor.capture())).thenAnswer(invocation -> {
-            Resumes toSave = invocation.getArgument(0);
-            return Resumes.builder()
-                    .id(99L)
-                    .member(toSave.getMember())
-                    .originalFilename(toSave.getOriginalFilename())
-                    .storedFileUrl(toSave.getStoredFileUrl())
-                    .fileSize(toSave.getFileSize())
-                    .isActive(toSave.getIsActive())
-                    .updatedAt(toSave.getUpdatedAt())
-                    .build();
-        });
+        Resumes savedResume = Resumes.builder()
+                .id(99L)
+                .member(member)
+                .originalFilename("이력서.pdf")
+                .storedFileUrl(fileUrl)
+                .fileSize("14 B")
+                .isActive(true)
+                .updatedAt(LocalDate.now())
+                .build();
+        when(resumesRepository.save(captor.capture())).thenReturn(savedResume);
+        when(resumesRepository.findById(99L)).thenReturn(Optional.of(savedResume));
 
         Long resumeId = resumeService.uploadResume(EMAIL, file);
 

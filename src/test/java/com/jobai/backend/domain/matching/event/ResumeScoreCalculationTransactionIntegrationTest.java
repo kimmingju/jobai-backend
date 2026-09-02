@@ -80,7 +80,7 @@ class ResumeScoreCalculationTransactionIntegrationTest {
         }
 
         @Bean
-        TaskExecutor taskExecutor() {
+        TaskExecutor schedulerTaskExecutor() {
             return new SyncTaskExecutor();
         }
 
